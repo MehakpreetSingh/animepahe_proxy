@@ -1,47 +1,81 @@
-import { Transform, TransformCallback } from 'stream';
+import { Transform } from 'stream';
 
-export const allowedExtensions = ['.ts', '.png', '.jpg', '.webp', '.ico', '.html', '.js', '.css', '.txt'];
+// Extensions that should be treated as static files (direct pass-through)
+export const allowedExtensions = ['.ts', '.jpg', '.key', '.mp4', '.m4s', '.aac', '.mp3', '.webm'];
 
 export class LineTransform extends Transform {
-  private buffer: string;
+  private buffer: string = '';
   private baseUrl: string;
+  private proxyEndpoint: string;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, proxyEndpoint: string = '/m3u8-proxy') {
     super();
-    this.buffer = '';
     this.baseUrl = baseUrl;
+    this.proxyEndpoint = proxyEndpoint;
   }
 
-  _transform(chunk: Buffer, encoding: BufferEncoding, callback: TransformCallback) {
-    const data = this.buffer + chunk.toString();
-    const lines = data.split(/\r?\n/);
+  _transform(chunk: any, encoding: string, callback: Function) {
+    // Add new data to our buffer
+    this.buffer += chunk.toString();
+    
+    // Process complete lines
+    const lines = this.buffer.split('\n');
+    // Keep the last (potentially incomplete) line in the buffer
     this.buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const modifiedLine = this.processLine(line);
-      this.push(modifiedLine + '\n');
-    }
-
+    
+    // Process each complete line
+    const processedLines = lines.map(line => this.processLine(line));
+    
+    // Push processed lines back to stream
+    this.push(processedLines.join('\n') + (processedLines.length ? '\n' : ''));
     callback();
   }
 
-  _flush(callback: TransformCallback) {
+  _flush(callback: Function) {
+    // Process any remaining data
     if (this.buffer) {
-      const modifiedLine = this.processLine(this.buffer);
-      this.push(modifiedLine);
+      this.push(this.processLine(this.buffer));
     }
     callback();
   }
 
   private processLine(line: string): string {
-    if (line.endsWith('.m3u8') || line.endsWith('.ts')) {
-      return `m3u8-proxy?url=${this.baseUrl}${line}`;
+    // Skip empty lines or comments that don't contain URLs
+    if (!line || (line.startsWith('#') && !line.includes('URI='))) {
+      return line;
     }
 
-    if (allowedExtensions.some(ext => line.endsWith(ext))) {
-      return `m3u8-proxy?url=${line}`;
+    // Handle lines with URI attribute (like encryption keys)
+    if (line.includes('URI="')) {
+      return line.replace(/URI="([^"]+)"/g, (match, url) => {
+        const absoluteUrl = this.resolveUrl(url);
+        return `URI="${this.proxyEndpoint}?url=${encodeURIComponent(absoluteUrl)}"`;
+      });
     }
-
+    
+    // Handle segment URLs (non-comment lines)
+    if (!line.startsWith('#')) {
+      const absoluteUrl = this.resolveUrl(line);
+      return `${this.proxyEndpoint}?url=${encodeURIComponent(absoluteUrl)}`;
+    }
+    
     return line;
+  }
+
+  private resolveUrl(url: string): string {
+    // If the URL is already absolute, return it as is
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      return url;
+    }
+    
+    // Handle relative URLs
+    if (url.startsWith('/')) {
+      // Absolute path relative to domain
+      const baseUrlObj = new URL(this.baseUrl);
+      return `${baseUrlObj.protocol}//${baseUrlObj.host}${url}`;
+    }
+    
+    // Relative path
+    return `${this.baseUrl}${url}`;
   }
 }
